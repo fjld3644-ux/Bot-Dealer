@@ -424,94 +424,105 @@ def meets_trigger(deal: dict) -> bool:
 
 # ── COUPON SCRAPER — free public sources ──────────────────────────────────────
 def scrape_coupons() -> list:
-    """
-    Scrapes free promo codes from public coupon sites.
-    Returns list of coupon deals to post separately.
-    """
     coupons = []
     sources = [
-        # Ma3ak (Morocco coupon site)
-        {"url": "https://www.ma3ak.ma/feed/", "type": "rss"},
-        # Dealabs promo codes RSS
-        {"url": "https://www.dealabs.com/rss/codes-promo", "type": "rss"},
-        # Coupert public feed
-        {"url": "https://www.coupert.com/rss.xml", "type": "rss"},
+        "https://www.dealabs.com/rss/codes-promo",
+        "https://www.ma3ak.ma/feed/",
     ]
 
-    for source in sources:
+    for url in sources:
         try:
-            for entry in parse_rss(source["url"])[:10]:
+            for entry in parse_rss(url)[:10]:
                 title = entry.get("title", "")
                 link  = entry.get("link", "")
-                desc  = entry.get("desc", "")
+                desc  = BeautifulSoup(entry.get("desc", ""), "html.parser").get_text()
 
-                # Extract coupon code — look for patterns like CODE, PROMO20, SAVE10
-                code_match = re.search(
-                    r'\b([A-Z0-9]{4,15})\b',
-                    title + " " + desc
-                )
+                full_text = title + " " + desc
+
+                # Extract coupon code
+                code_match = re.search(r'\b([A-Z][A-Z0-9]{3,14})\b', full_text)
                 code = code_match.group(1) if code_match else ""
-
-                # Skip if no code found or code looks like a number only
                 if not code or code.isdigit():
                     continue
 
-                # Detect store
-                store = "Unknown"
-                for s in ["amazon", "aliexpress", "jumia", "ebay", "noon", "shein"]:
-                    if s in title.lower() + desc.lower() + link.lower():
-                        store = s.capitalize()
+                # Skip common false positives
+                skip_words = {"HTTP", "HTTPS", "HTML", "FREE", "SALE", "DEAL", "CODE", "PROMO"}
+                if code in skip_words:
+                    continue
+
+                # Detect store from title/desc/link
+                store = "Dealabs"
+                store_map = {
+                    "amazon": "Amazon", "aliexpress": "AliExpress",
+                    "jumia": "Jumia", "ebay": "eBay", "shein": "Shein",
+                    "noon": "Noon", "cdiscount": "Cdiscount",
+                    "zalando": "Zalando", "booking": "Booking.com",
+                }
+                for key, name in store_map.items():
+                    if key in full_text.lower() + link.lower():
+                        store = name
                         break
 
-                # Extract discount %
-                pct_match = re.search(r'(\d+)\s*%', title + " " + desc)
+                # Extract discount % or amount
+                pct_match = re.search(r'(\d+)\s*%', full_text)
+                amt_match = re.search(r'(\d+)[€$]\s*(?:de réduction|off|discount)', full_text)
                 pct = pct_match.group(1) if pct_match else ""
+                amt = amt_match.group(1) if amt_match else ""
+
+                # Clean title — remove the code from title if it appears
+                clean_title = title.replace(code, "").strip(" -–|")[:80]
 
                 coupons.append({
-                    "title":          title[:80],
-                    "store":          store,
-                    "original_price": "",
-                    "sale_price":     "",
-                    "discount_pct":   pct,
-                    "url":            link,
-                    "coupon":         code,
-                    "category":       "general",
-                    "free_shipping":  False,
-                    "is_coupon":      True,
+                    "title":         clean_title,
+                    "store":         store,
+                    "discount_pct":  pct,
+                    "discount_amt":  amt,
+                    "url":           link,
+                    "coupon":        code,
+                    "is_coupon":     True,
                 })
         except Exception as e:
-            log.warning(f"Coupon source error: {e}")
+            log.warning(f"Coupon source error ({url}): {e}")
 
     log.info(f"🎟 Coupons found: {len(coupons)}")
     return coupons
 
 
 def format_coupon_telegram(deal: dict) -> str:
-    """Special format for coupon-only posts."""
-    store    = deal.get("store", "Unknown")
+    """Nicely formatted coupon post."""
+    store    = deal.get("store", "Dealabs")
     s_emoji  = STORE_EMOJI.get(store.lower(), "🏪")
-    title    = deal.get("title", "Promo Code")[:80]
+    title    = deal.get("title", "")[:80]
     code     = deal.get("coupon", "")
     pct      = deal.get("discount_pct", "")
+    amt      = deal.get("discount_amt", "")
     url      = deal.get("url", "")
 
-    pct_line  = f"💰 Save <b>{pct}%</b> with this code!" if pct else "💰 Use this code at checkout!"
-    link_line = f'👉 <a href="{url}">Shop now</a>' if url else ""
+    # Savings line
+    if pct:
+        saving_line = f"💰 Save <b>{pct}%</b> on your order!"
+    elif amt:
+        saving_line = f"💰 Save <b>{amt}€</b> on your order!"
+    else:
+        saving_line = "💰 Apply at checkout for instant savings!"
+
+    link_line = f'🛒 <a href="{url}">Shop now →</a>' if url else ""
+    title_line = f"📌 {title}" if title else ""
 
     lines = [
-        f"🎟 <b>PROMO CODE — {store} {s_emoji}</b>",
+        f"🎟️ <b>PROMO CODE — {store} {s_emoji}</b>",
         "",
-        f"📋 Code: <code>{code}</code>",
+        f"🔑 Code: <code>{code}</code>  ← tap to copy",
         "",
-        pct_line,
-        f"🛒 {title}",
+        saving_line,
+        title_line,
         "",
         link_line,
         "",
-        "⚡ Copy the code and use it at checkout!",
-        f"#coupon #promocode #{store.lower()} #deals",
+        "⚡ Limited time — use it before it expires!",
+        f"#coupon #promocode #{store.lower().replace(' ','')} #deals #bonplan",
     ]
-    return "\n".join(l for l in lines if l is not None)
+    return "\n".join(l for l in lines if l)
 
 
 # ── 24/7 keep-alive web server ─────────────────────────────────────────────────
