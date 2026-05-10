@@ -46,16 +46,28 @@ HEADERS = {
 }
 
 # ── Already-posted tracker ─────────────────────────────────────────────────────
+# Global in-memory set — survives across scans, resets only on restart
+POSTED_IDS: set = set()
+
 def load_posted() -> set:
+    global POSTED_IDS
+    if POSTED_IDS:
+        return POSTED_IDS  # already loaded — use memory
     try:
         with open(POSTED_FILE) as f:
-            return set(json.load(f))
+            POSTED_IDS = set(json.load(f))
     except Exception:
-        return set()
+        POSTED_IDS = set()
+    return POSTED_IDS
 
 def save_posted(posted: set):
-    with open(POSTED_FILE, "w") as f:
-        json.dump(list(posted)[-500:], f)  # keep last 500
+    global POSTED_IDS
+    POSTED_IDS = posted  # update memory
+    try:
+        with open(POSTED_FILE, "w") as f:
+            json.dump(list(posted)[-500:], f)
+    except Exception:
+        pass  # memory still works even if file write fails
 
 def deal_id(deal: dict) -> str:
     # For coupons use the code as unique key, for deals use title+url
@@ -667,10 +679,10 @@ if __name__ == "__main__":
             free_shipping=True,
         )
     else:
-        log.info("🚀 Deal Bot started — scanning every hour")
+        log.info("🚀 Deal Bot started — scanning every 3 hours")
         log.info(f"📊 Min discount: {MIN_DISCOUNT_PCT}% | Channel: {CHANNEL_ID}")
         run_auto_scan()  # run immediately on start
-        schedule.every(1).hours.do(run_auto_scan)
+        schedule.every(3).hours.do(run_auto_scan)
         schedule.every(6).hours.do(lambda: log.info("💓 Bot still alive"))
         while True:
             schedule.run_pending()
