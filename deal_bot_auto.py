@@ -58,7 +58,11 @@ def save_posted(posted: set):
         json.dump(list(posted)[-500:], f)  # keep last 500
 
 def deal_id(deal: dict) -> str:
-    key = f"{deal.get('title', '')}{deal.get('url', '')}"
+    # For coupons use the code as unique key, for deals use title+url
+    if deal.get("is_coupon") and deal.get("coupon"):
+        key = f"coupon_{deal['coupon']}"
+    else:
+        key = f"{deal.get('title', '')}{deal.get('url', '')}"
     return hashlib.md5(key.encode()).hexdigest()
 
 # ── Store emojis ───────────────────────────────────────────────────────────────
@@ -469,8 +473,11 @@ def scrape_coupons() -> list:
                 pct = pct_match.group(1) if pct_match else ""
                 amt = amt_match.group(1) if amt_match else ""
 
-                # Clean title — remove the code from title if it appears
-                clean_title = title.replace(code, "").strip(" -–|")[:80]
+                # Clean up title — remove common RSS junk
+                clean_title = title.replace(code, "").strip(" -–|")
+                for junk in ["[Via App]", "[via app]", "[App]", "[Appli]", "[Deal]", "[Code]"]:
+                    clean_title = clean_title.replace(junk, "").strip()
+                clean_title = clean_title[:80]
 
                 coupons.append({
                     "title":         clean_title,
@@ -508,6 +515,9 @@ def format_coupon_telegram(deal: dict) -> str:
 
     url_clean = url.split(" ")[0].strip() if url else ""  # remove any trailing junk
     link_line  = f'🛒 <a href="{url_clean}">Shop now</a>' if url_clean else ""
+    # Clean junk from title
+    for junk in ["[Via App]", "[via app]", "[App]", "[Appli]", "[Deal]", "[Code]"]:
+        title = title.replace(junk, "").strip()
     title_line = f"📌 {title}" if title else ""
 
     lines = [
