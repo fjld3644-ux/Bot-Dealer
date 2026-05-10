@@ -1,31 +1,24 @@
 """
-Deal Bot — AUTOMATIC VERSION (100% FREE)
-=========================================
-Scrapes deals from Amazon, AliExpress, Jumia and Dealabs
-using free RSS feeds and public pages. No API keys needed.
+Deal Bot — AUTOMATIC VERSION (100% FREE, NO DUPLICATES)
+========================================================
+Uses a local JSON file + in-memory cache to prevent duplicates.
+Scans Dealabs, Jumia, AliExpress every 3 hours.
 
 Setup:
   pip install python-telegram-bot requests schedule python-dotenv beautifulsoup4
 
-.env file required:
-  TELEGRAM_BOT_TOKEN=your_token_here
+.env file:
+  TELEGRAM_BOT_TOKEN=your_token
   TELEGRAM_CHANNEL_ID=@your_channel
   MIN_DISCOUNT_PCT=20
 """
 
-import os
-import re
-import time
-import logging
-import schedule
-import asyncio
-import hashlib
-import json
+import os, re, time, logging, schedule, asyncio, hashlib, json
 from datetime import datetime
 from dotenv import load_dotenv
 import requests
-import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 from telegram import Bot
 from telegram.constants import ParseMode
 
@@ -33,674 +26,250 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Config ─────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID       = os.getenv("TELEGRAM_CHANNEL_ID")
 MIN_DISCOUNT_PCT = int(os.getenv("MIN_DISCOUNT_PCT", 20))
-POSTED_FILE      = "posted_deals.json"  # tracks already-posted deals
 
 bot = Bot(token=TELEGRAM_TOKEN)
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-}
-
-# ── Already-posted tracker ─────────────────────────────────────────────────────
-# Global in-memory set
+# ── Duplicate prevention ───────────────────────────────────────────────────────
+# POSTED_IDS lives in memory for the whole Railway session.
+# It is also saved to posted.json so it survives short restarts.
 POSTED_IDS: set = set()
 
-def load_posted() -> set:
-    """Load from env var (survives Railway restarts) or file."""
+async def init_memory():
     global POSTED_IDS
-    if POSTED_IDS:
-        return POSTED_IDS
-    # Try env var first (Railway-safe)
-    env_ids = os.getenv("POSTED_IDS_CACHE", "")
-    if env_ids:
-        POSTED_IDS = set(env_ids.split(","))
-        log.info(f"📋 Loaded {len(POSTED_IDS)} posted IDs from env cache")
-        return POSTED_IDS
-    # Fall back to file
     try:
-        with open(POSTED_FILE) as f:
-            POSTED_IDS = set(json.load(f))
-        log.info(f"📋 Loaded {len(POSTED_IDS)} posted IDs from file")
+        with open("posted.json") as f:
+            POSTED_IDS = set(json.load(f).get("ids", []))
+        log.info(f"📋 Loaded {len(POSTED_IDS)} posted IDs")
     except Exception:
         POSTED_IDS = set()
-    return POSTED_IDS
-
-def save_posted(posted: set):
-    """Save to file. In-memory always up to date."""
-    global POSTED_IDS
-    POSTED_IDS = posted
-    try:
-        with open(POSTED_FILE, "w") as f:
-            json.dump(list(posted)[-500:], f)
-    except Exception:
-        pass
+        log.info("📋 Fresh start")
 
 def is_posted(did: str) -> bool:
-    """Fast check — use global memory directly."""
     return did in POSTED_IDS
 
+def mark_posted(did: str):
+    POSTED_IDS.add(did)
+    try:
+        with open("posted.json", "w") as f:
+            json.dump({"ids": list(POSTED_IDS)[-1000:], "ts": datetime.now().isoformat()}, f)
+    except Exception:
+        pass  # memory still works
+
 def deal_id(deal: dict) -> str:
-    # For coupons use the code as unique key, for deals use title+url
     if deal.get("is_coupon") and deal.get("coupon"):
-        key = f"coupon_{deal['coupon']}"
-    else:
-        key = f"{deal.get('title', '')}{deal.get('url', '')}"
+        return hashlib.md5(f"coupon_{deal['coupon']}".encode()).hexdigest()
+    key = f"{deal.get('title','')[:50]}{deal.get('url','')[:80]}"
     return hashlib.md5(key.encode()).hexdigest()
 
-# ── Store emojis ───────────────────────────────────────────────────────────────
-STORE_EMOJI = {
-    "amazon":     "📦",
-    "ebay":       "🛒",
-    "aliexpress": "🌏",
-    "jumia":      "🛍️",
-    "dealabs":    "🔥",
-}
+# ── Store + category ───────────────────────────────────────────────────────────
+STORE_EMOJI = {"amazon":"📦","ebay":"🛒","aliexpress":"🌏","jumia":"🛍️","dealabs":"🔥","shein":"👗","noon":"🌙"}
 
-CATEGORY_EMOJI = {
-    "tech":        "📱",
-    "phones":      "📱",
-    "audio":       "🎧",
-    "computers":   "💻",
-    "gaming":      "🎮",
-    "fashion":     "👗",
-    "shoes":       "👟",
-    "home":        "🏠",
-    "kitchen":     "🍳",
-    "beauty":      "💄",
-    "health":      "💊",
-    "sports":      "⚽",
-    "food":        "🍔",
-    "kids":        "🧸",
-    "travel":      "✈️",
-    "general":     "📦",
-}
-
-# ── Smart category detector ────────────────────────────────────────────────────
 CATEGORY_KEYWORDS = {
-    "audio":     ["ecouteur", "earphone", "headphone", "casque", "bluetooth", "speaker", "enceinte", "airpod"],
-    "phones":    ["phone", "iphone", "samsung", "smartphone", "mobile", "xiaomi", "redmi", "realme", "oppo"],
-    "computers": ["laptop", "pc", "ordinateur", "computer", "tablet", "tablette", "ipad", "lenovo", "dell", "hp"],
-    "gaming":    ["gaming", "playstation", "xbox", "nintendo", "manette", "controller", "game", "jeu"],
-    "fashion":   ["shirt", "dress", "chemise", "robe", "veste", "jacket", "pull", "hoodie", "pantalon", "jean"],
-    "shoes":     ["shoe", "sneaker", "basket", "chaussure", "boot", "sandale", "nike", "adidas"],
-    "home":      ["sofa", "bed", "lit", "chaise", "table", "meuble", "furniture", "lampe", "lamp", "cushion"],
-    "kitchen":   ["kitchen", "cuisine", "frigo", "refrigerator", "microwave", "blender", "cafetière", "coffee"],
-    "beauty":    ["cream", "crème", "perfume", "parfum", "makeup", "lipstick", "shampoo", "skincare", "serum"],
-    "health":    ["vitamin", "supplement", "mask", "masque", "sanitizer", "thermometer", "scale", "balance"],
-    "sports":    ["sport", "gym", "fitness", "yoga", "vélo", "bike", "treadmill", "dumbbell", "haltère"],
-    "kids":      ["kids", "enfant", "baby", "bébé", "toy", "jouet", "stroller", "poussette"],
-    "food":      ["food", "nourriture", "snack", "chocolate", "café", "tea", "thé", "nuts"],
+    "audio":     ["ecouteur","earphone","headphone","casque","bluetooth","speaker","enceinte","airpod","tws"],
+    "phones":    ["phone","iphone","samsung","smartphone","mobile","xiaomi","redmi","realme","oppo","tecno","infinix"],
+    "computers": ["laptop","pc","ordinateur","computer","tablet","tablette","ipad","lenovo","dell","asus"],
+    "gaming":    ["gaming","playstation","xbox","nintendo","manette","controller","ps4","ps5"],
+    "fashion":   ["shirt","dress","chemise","robe","veste","jacket","pull","hoodie","pantalon","jean"],
+    "shoes":     ["shoe","sneaker","basket","chaussure","boot","sandale","nike","adidas","puma"],
+    "home":      ["sofa","bed","lit","chaise","table","meuble","furniture","lampe","matelas"],
+    "kitchen":   ["kitchen","cuisine","frigo","refrigerator","microwave","blender","cafetiere","coffee"],
+    "beauty":    ["cream","creme","perfume","parfum","makeup","lipstick","shampoo","skincare","serum"],
+    "health":    ["vitamin","supplement","mask","masque","thermometer","balance"],
+    "sports":    ["sport","gym","fitness","yoga","velo","bike","treadmill","dumbbell","running"],
+    "kids":      ["kids","enfant","baby","bebe","toy","jouet","stroller","poussette"],
 }
+CATEGORY_EMOJI = {"audio":"🎧","phones":"📱","computers":"💻","gaming":"🎮","fashion":"👗","shoes":"👟","home":"🏠","kitchen":"🍳","beauty":"💄","health":"💊","sports":"⚽","kids":"🧸","general":"📦"}
+TAG_MAP = {"audio":"#audio #ecouteurs","phones":"#smartphone #mobile","computers":"#laptop #tech","gaming":"#gaming #jeux","fashion":"#mode #vetements","shoes":"#chaussures #sneakers","home":"#maison #deco","kitchen":"#cuisine","beauty":"#beaute #skincare","health":"#sante","sports":"#sport #fitness","kids":"#enfants","general":"#bonplan"}
 
 def detect_category(title: str) -> str:
-    title_lower = title.lower()
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        for kw in keywords:
-            if kw in title_lower:
-                return category
+    t = title.lower()
+    for cat, kws in CATEGORY_KEYWORDS.items():
+        if any(kw in t for kw in kws):
+            return cat
     return "general"
 
-# ── Telegram formatter ─────────────────────────────────────────────────────────
-def format_telegram(deal: dict) -> str:
-    store    = deal.get("store", "Unknown")
-    s_emoji  = STORE_EMOJI.get(store.lower(), "🏪")
-    title    = deal.get("title", "Amazing Deal")[:80]
-    orig     = deal.get("original_price", "")
-    sale     = deal.get("sale_price", "")
-    pct      = deal.get("discount_pct", "")
-    url      = deal.get("url", "")
-    coupon   = deal.get("coupon", "")
+# ── Formatters ─────────────────────────────────────────────────────────────────
+def format_deal(deal: dict) -> str:
+    store    = deal.get("store","Unknown")
+    s_emoji  = STORE_EMOJI.get(store.lower(),"🏪")
+    title    = deal.get("title","Deal")[:80]
+    orig     = deal.get("original_price","")
+    sale     = deal.get("sale_price","")
+    pct      = deal.get("discount_pct","")
+    url      = deal.get("url","")
+    coupon   = deal.get("coupon","")
     shipping = deal.get("free_shipping", False)
+    cat      = detect_category(title)
+    c_emoji  = CATEGORY_EMOJI.get(cat,"📦")
+    tags     = TAG_MAP.get(cat,"#bonplan")
 
-    # Auto-detect category from title
-    category = detect_category(title)
-    c_emoji  = CATEGORY_EMOJI.get(category, "📦")
-
-    # Price line — always show original + sale if both exist
-    if orig and sale:
-        price_line = f"💰 <s>{orig}</s> → <b>{sale}</b> ({pct}% OFF)"
-    elif sale and pct:
-        price_line = f"💰 <b>{sale}</b> — {pct}% OFF"
-    elif pct:
-        price_line = f"💰 <b>{pct}% OFF</b>"
-    else:
-        price_line = f"💰 <b>{sale}</b>" if sale else ""
-
-    coupon_line   = f"🎟 Coupon: <code>{coupon}</code>" if coupon else ""
-    shipping_line = "🚚 FREE Shipping!" if shipping else ""
-    link_line     = f'👉 <a href="{url}">Grab the deal</a>' if url else ""
-
-    # Smart hashtags based on detected category
-    tag_map = {
-        "audio":     "#audio #ecouteurs #bluetooth",
-        "phones":    "#smartphone #mobile #telephone",
-        "computers": "#laptop #ordinateur #tech",
-        "gaming":    "#gaming #jeux #console",
-        "fashion":   "#mode #fashion #vetements",
-        "shoes":     "#chaussures #shoes #sneakers",
-        "home":      "#maison #home #deco",
-        "kitchen":   "#cuisine #kitchen #electromenager",
-        "beauty":    "#beaute #beauty #skincare",
-        "health":    "#sante #health #bienetre",
-        "sports":    "#sport #fitness #gym",
-        "kids":      "#enfants #kids #jouets",
-        "food":      "#food #nourriture #snacks",
-        "general":   "#bonplan #promo",
-    }
-    category_tags = tag_map.get(category, "#bonplan")
+    if orig and sale:   price = f"💰 <s>{orig}</s> → <b>{sale}</b> ({pct}% OFF)"
+    elif sale and pct:  price = f"💰 <b>{sale}</b> — {pct}% OFF"
+    elif pct:           price = f"💰 <b>{pct}% OFF</b>"
+    else:               price = f"💰 <b>{sale}</b>" if sale else ""
 
     lines = [
-        f"🔥 {c_emoji} <b>{title}</b>",
-        "",
-        price_line,
-        f"🏪 Store: {store} {s_emoji}",
-        coupon_line,
-        shipping_line,
-        "",
-        link_line,
-        "",
+        f"🔥 {c_emoji} <b>{title}</b>","",price,
+        f"🏪 {store} {s_emoji}",
+        f"🎟 Coupon: <code>{coupon}</code>" if coupon else "",
+        "🚚 FREE Shipping!" if shipping else "","",
+        f'👉 <a href="{url}">Grab the deal</a>' if url else "","",
         "⏰ Limited time — act fast!",
-        f"#deals #{store.lower().replace(' ', '')} {category_tags}",
-    ]
-    return "\n".join(l for l in lines if l is not None)
-
-
-# ── Telegram poster ────────────────────────────────────────────────────────────
-async def post_to_telegram(text: str) -> bool:
-    try:
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=False
-        )
-        log.info("✅ Posted to Telegram!")
-        return True
-    except Exception as e:
-        log.error(f"❌ Telegram error: {e}")
-        return False
-
-
-# ── SCRAPER 1: Dealabs RSS (best — covers all stores) ─────────────────────────
-def parse_rss(url: str) -> list:
-    """Fetch and parse an RSS feed without feedparser."""
-    items = []
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        root = ET.fromstring(r.content)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        for item in root.findall(".//item"):
-            title = item.findtext("title", "")
-            link  = item.findtext("link", "")
-            desc  = item.findtext("description", "")
-            items.append({"title": title, "link": link, "desc": desc})
-    except Exception as e:
-        log.warning(f"RSS parse error ({url}): {e}")
-    return items
-
-
-def scrape_dealabs() -> list:
-    deals = []
-    feeds = [
-        "https://www.dealabs.com/rss/hot-deals",
-        "https://www.dealabs.com/rss/nouveaux-deals",
-    ]
-    for url in feeds:
-        try:
-            for entry in parse_rss(url)[:15]:
-                title = entry.get("title", "")
-                link  = entry.get("link", "")
-                desc  = entry.get("desc", "")
-
-                # Extract discount % from title or description
-                pct_match = re.search(r'(\d+)\s*%', title + " " + desc)
-                pct = pct_match.group(1) if pct_match else "0"
-
-                # Extract price
-                price_match = re.search(r'[\$€£]?\s*(\d+[.,]\d+)', desc)
-                price = price_match.group(0) if price_match else ""
-
-                # Detect store from title/link
-                store = "Dealabs"
-                for s in ["amazon", "aliexpress", "jumia", "ebay"]:
-                    if s in title.lower() or s in link.lower() or s in desc.lower():
-                        store = s.capitalize()
-                        break
-
-                deals.append({
-                    "title":          title,
-                    "store":          store,
-                    "original_price": "",
-                    "sale_price":     price,
-                    "discount_pct":   pct,
-                    "url":            link,
-                    "coupon":         "",
-                    "category":       "general",
-                    "free_shipping":  "livraison gratuite" in desc.lower() or "free shipping" in desc.lower(),
-                })
-        except Exception as e:
-            log.error(f"Dealabs RSS error: {e}")
-    log.info(f"🔥 Dealabs: {len(deals)} deals found")
-    return deals
-
-
-# ── SCRAPER 2: Amazon deals page ───────────────────────────────────────────────
-def scrape_amazon() -> list:
-    deals = []
-    urls = [
-        "https://www.amazon.fr/deals",
-        "https://www.amazon.eg/deals",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=10)
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            for item in soup.select("[data-component-type='s-search-result']")[:10]:
-                title_el = item.select_one("h2 span")
-                price_el = item.select_one(".a-price .a-offscreen")
-                orig_el  = item.select_one(".a-price.a-text-price .a-offscreen")
-                link_el  = item.select_one("h2 a")
-                badge_el = item.select_one(".a-badge-text")
-
-                if not title_el or not price_el:
-                    continue
-
-                title = title_el.get_text(strip=True)
-                sale  = price_el.get_text(strip=True)
-                orig  = orig_el.get_text(strip=True) if orig_el else ""
-                link  = "https://amazon.fr" + link_el["href"] if link_el else url
-                badge = badge_el.get_text(strip=True) if badge_el else ""
-
-                pct_match = re.search(r'(\d+)', badge)
-                pct = pct_match.group(1) if pct_match else "0"
-
-                deals.append({
-                    "title":          title,
-                    "store":          "Amazon",
-                    "original_price": orig,
-                    "sale_price":     sale,
-                    "discount_pct":   pct,
-                    "url":            link,
-                    "coupon":         "",
-                    "category":       "general",
-                    "free_shipping":  False,
-                })
-        except Exception as e:
-            log.error(f"Amazon scrape error: {e}")
-
-    log.info(f"📦 Amazon: {len(deals)} deals found")
-    return deals
-
-
-# ── SCRAPER 3: AliExpress deals ────────────────────────────────────────────────
-def scrape_aliexpress() -> list:
-    deals = []
-    try:
-        url = "https://www.aliexpress.com/deals.htm"
-        r   = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for item in soup.select(".item-card")[:10]:
-            title_el = item.select_one(".item-title")
-            price_el = item.select_one(".sale-price")
-            orig_el  = item.select_one(".orig-price")
-            link_el  = item.select_one("a")
-            disc_el  = item.select_one(".discount")
-
-            if not title_el or not price_el:
-                continue
-
-            title = title_el.get_text(strip=True)
-            sale  = price_el.get_text(strip=True)
-            orig  = orig_el.get_text(strip=True) if orig_el else ""
-            link  = "https:" + link_el["href"] if link_el and link_el.get("href", "").startswith("//") else (link_el["href"] if link_el else url)
-            disc  = disc_el.get_text(strip=True) if disc_el else "0"
-
-            pct_match = re.search(r'(\d+)', disc)
-            pct = pct_match.group(1) if pct_match else "0"
-
-            deals.append({
-                "title":          title,
-                "store":          "AliExpress",
-                "original_price": orig,
-                "sale_price":     sale,
-                "discount_pct":   pct,
-                "url":            link,
-                "coupon":         "",
-                "category":       "general",
-                "free_shipping":  True,
-            })
-    except Exception as e:
-        log.error(f"AliExpress scrape error: {e}")
-
-    log.info(f"🌏 AliExpress: {len(deals)} deals found")
-    return deals
-
-
-# ── SCRAPER 4: Jumia deals ─────────────────────────────────────────────────────
-def scrape_jumia() -> list:
-    deals = []
-    urls = [
-        "https://www.jumia.ma/flash-sales/",
-        "https://www.jumia.ma/deals-of-the-day/",
-        "https://www.jumia.ma/mlp-toutes-les-promotions/",
-    ]
-    for url in urls:
-        try:
-            r    = requests.get(url, headers=HEADERS, timeout=10)
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            for item in soup.select("article.prd")[:15]:
-                title_el = item.select_one(".name")
-                price_el = item.select_one(".prc")
-                orig_el  = item.select_one(".old")
-                disc_el  = item.select_one(".bdg._dsct")
-                link_el  = item.select_one("a.core")
-
-                if not title_el or not price_el:
-                    continue
-
-                title = title_el.get_text(strip=True)
-                sale  = price_el.get_text(strip=True)
-                orig  = orig_el.get_text(strip=True) if orig_el else ""
-                disc  = disc_el.get_text(strip=True) if disc_el else "0"
-                link  = "https://www.jumia.ma" + link_el["href"] if link_el else url
-
-                pct_match = re.search(r'(\d+)', disc)
-                pct = pct_match.group(1) if pct_match else "0"
-
-                # Skip if no real discount info found
-                if pct == "0" and not orig:
-                    continue
-
-                deals.append({
-                    "title":          title,
-                    "store":          "Jumia",
-                    "original_price": orig,
-                    "sale_price":     sale,
-                    "discount_pct":   pct,
-                    "url":            link,
-                    "coupon":         "",
-                    "category":       "general",
-                    "free_shipping":  False,
-                })
-        except Exception as e:
-            log.error(f"Jumia scrape error ({url}): {e}")
-
-    log.info(f"🛍️ Jumia: {len(deals)} deals found")
-    return deals
-
-
-# ── Trigger check ──────────────────────────────────────────────────────────────
-def meets_trigger(deal: dict) -> bool:
-    try:
-        pct = int(deal.get("discount_pct", 0))
-    except Exception:
-        pct = 0
-    has_coupon = bool(deal.get("coupon"))
-    is_flash   = deal.get("flash_sale", False)
-    free_ship  = deal.get("free_shipping", False)
-    if pct >= MIN_DISCOUNT_PCT: return True
-    if has_coupon:               return True
-    if is_flash:                 return True
-    if free_ship and pct >= 10:  return True
-    return False
-
-
-# ── COUPON SCRAPER — free public sources ──────────────────────────────────────
-def scrape_coupons() -> list:
-    coupons = []
-    sources = [
-        "https://www.dealabs.com/rss/codes-promo",
-        "https://www.ma3ak.ma/feed/",
-    ]
-
-    for url in sources:
-        try:
-            for entry in parse_rss(url)[:10]:
-                title = entry.get("title", "")
-                link  = entry.get("link", "")
-                desc  = BeautifulSoup(entry.get("desc", ""), "html.parser").get_text()
-
-                full_text = title + " " + desc
-
-                # Extract coupon code
-                code_match = re.search(r'\b([A-Z][A-Z0-9]{3,14})\b', full_text)
-                code = code_match.group(1) if code_match else ""
-                if not code or code.isdigit():
-                    continue
-
-                # Skip common false positives
-                skip_words = {"HTTP", "HTTPS", "HTML", "FREE", "SALE", "DEAL", "CODE", "PROMO"}
-                if code in skip_words:
-                    continue
-
-                # Detect store from title/desc/link
-                store = "Dealabs"
-                store_map = {
-                    "amazon": "Amazon", "aliexpress": "AliExpress",
-                    "jumia": "Jumia", "ebay": "eBay", "shein": "Shein",
-                    "noon": "Noon", "cdiscount": "Cdiscount",
-                    "zalando": "Zalando", "booking": "Booking.com",
-                }
-                for key, name in store_map.items():
-                    if key in full_text.lower() + link.lower():
-                        store = name
-                        break
-
-                # Extract discount % or amount
-                pct_match = re.search(r'(\d+)\s*%', full_text)
-                amt_match = re.search(r'(\d+)[€$]\s*(?:de réduction|off|discount)', full_text)
-                pct = pct_match.group(1) if pct_match else ""
-                amt = amt_match.group(1) if amt_match else ""
-
-                # Clean up title — remove common RSS junk
-                clean_title = title.replace(code, "").strip(" -–|")
-                for junk in ["[Via App]", "[via app]", "[App]", "[Appli]", "[Deal]", "[Code]"]:
-                    clean_title = clean_title.replace(junk, "").strip()
-                clean_title = clean_title[:80]
-
-                coupons.append({
-                    "title":         clean_title,
-                    "store":         store,
-                    "discount_pct":  pct,
-                    "discount_amt":  amt,
-                    "url":           link,
-                    "coupon":        code,
-                    "is_coupon":     True,
-                })
-        except Exception as e:
-            log.warning(f"Coupon source error ({url}): {e}")
-
-    log.info(f"🎟 Coupons found: {len(coupons)}")
-    return coupons
-
-
-def format_coupon_telegram(deal: dict) -> str:
-    """Nicely formatted coupon post."""
-    store    = deal.get("store", "Dealabs")
-    s_emoji  = STORE_EMOJI.get(store.lower(), "🏪")
-    title    = deal.get("title", "")[:80]
-    code     = deal.get("coupon", "")
-    pct      = deal.get("discount_pct", "")
-    amt      = deal.get("discount_amt", "")
-    url      = deal.get("url", "")
-
-    # Savings line
-    if pct:
-        saving_line = f"💰 Save <b>{pct}%</b> on your order!"
-    elif amt:
-        saving_line = f"💰 Save <b>{amt}€</b> on your order!"
-    else:
-        saving_line = "💰 Apply at checkout for instant savings!"
-
-    url_clean = url.split(" ")[0].strip() if url else ""  # remove any trailing junk
-    link_line  = f'🛒 <a href="{url_clean}">Shop now</a>' if url_clean else ""
-    # Clean junk from title
-    for junk in ["[Via App]", "[via app]", "[App]", "[Appli]", "[Deal]", "[Code]"]:
-        title = title.replace(junk, "").strip()
-    title_line = f"📌 {title}" if title else ""
-
-    lines = [
-        f"🎟️ <b>PROMO CODE — {store} {s_emoji}</b>",
-        "",
-        f"🔑 Code: <code>{code}</code>",
-        "👆 Tap the code to copy it!",
-        "",
-        saving_line,
-        title_line,
-        "",
-        link_line,
-        "⚡ Limited time — use before it expires!",
-        f"#coupon #promocode #{store.lower().replace(' ','')} #deals #bonplan",
+        f"#deals #{store.lower().replace(' ','')} {tags}",
     ]
     return "\n".join(l for l in lines if l)
 
+def format_coupon(deal: dict) -> str:
+    store   = deal.get("store","Dealabs")
+    s_emoji = STORE_EMOJI.get(store.lower(),"🏪")
+    title   = deal.get("title","")[:80]
+    code    = deal.get("coupon","")
+    pct     = deal.get("discount_pct","")
+    amt     = deal.get("discount_amt","")
+    url     = deal.get("url","").split(" ")[0].strip()
+    saving  = f"💰 Save <b>{pct}%</b>!" if pct else (f"💰 Save <b>{amt}€</b>!" if amt else "💰 Savings at checkout!")
+    lines = [
+        f"🎟️ <b>PROMO CODE — {store} {s_emoji}</b>","",
+        f"🔑 Code: <code>{code}</code>","👆 Tap the code to copy it!","",
+        saving,f"📌 {title}" if title else "","",
+        f'🛒 <a href="{url}">Shop now</a>' if url else "",
+        "⚡ Limited time — use before it expires!",
+        f"#coupon #promocode #{store.lower().replace(' ','')} #deals",
+    ]
+    return "\n".join(l for l in lines if l)
 
-# ── 24/7 keep-alive web server ─────────────────────────────────────────────────
+# ── Telegram ───────────────────────────────────────────────────────────────────
+async def post_to_telegram(text: str) -> bool:
+    try:
+        await bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+        log.info("✅ Posted!")
+        return True
+    except Exception as e:
+        log.error(f"❌ {e}")
+        return False
+
+# ── RSS parser ─────────────────────────────────────────────────────────────────
+def parse_rss(url: str) -> list:
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        root = ET.fromstring(r.content)
+        return [{"title": i.findtext("title",""), "link": i.findtext("link",""), "desc": BeautifulSoup(i.findtext("description",""), "html.parser").get_text()} for i in root.findall(".//item")]
+    except Exception as e:
+        log.warning(f"RSS error: {e}")
+        return []
+
+# ── Scrapers ───────────────────────────────────────────────────────────────────
+def scrape_dealabs() -> list:
+    deals = []
+    for url in ["https://www.dealabs.com/rss/hot-deals","https://www.dealabs.com/rss/nouveaux-deals"]:
+        for e in parse_rss(url)[:15]:
+            pct = re.search(r'(\d+)\s*%', e["title"]+" "+e["desc"])
+            price = re.search(r'[\$€£]\s*\d+[.,]\d+', e["desc"])
+            store = next((s.capitalize() for s in ["amazon","aliexpress","jumia","ebay"] if s in (e["title"]+e["desc"]+e["link"]).lower()), "Dealabs")
+            deals.append({"title":e["title"],"store":store,"original_price":"","sale_price":price.group(0) if price else "","discount_pct":pct.group(1) if pct else "0","url":e["link"],"coupon":"","free_shipping":"livraison gratuite" in e["desc"].lower()})
+    log.info(f"🔥 Dealabs: {len(deals)}")
+    return deals
+
+def scrape_jumia() -> list:
+    deals = []
+    for url in ["https://www.jumia.ma/flash-sales/","https://www.jumia.ma/deals-of-the-day/"]:
+        try:
+            soup = BeautifulSoup(requests.get(url, headers=HEADERS, timeout=10).text, "html.parser")
+            for item in soup.select("article.prd")[:15]:
+                t=item.select_one(".name"); p=item.select_one(".prc"); o=item.select_one(".old"); d=item.select_one(".bdg._dsct"); a=item.select_one("a.core")
+                if not t or not p: continue
+                pct=re.search(r'(\d+)', d.get_text() if d else "0")
+                orig=o.get_text(strip=True) if o else ""
+                if not pct and not orig: continue
+                deals.append({"title":t.get_text(strip=True),"store":"Jumia","original_price":orig,"sale_price":p.get_text(strip=True),"discount_pct":pct.group(1) if pct else "0","url":"https://www.jumia.ma"+a["href"] if a else url,"coupon":"","free_shipping":False})
+        except Exception as e: log.error(f"Jumia: {e}")
+    log.info(f"🛍️ Jumia: {len(deals)}")
+    return deals
+
+def scrape_aliexpress() -> list:
+    deals = []
+    try:
+        soup = BeautifulSoup(requests.get("https://www.aliexpress.com/deals.htm", headers=HEADERS, timeout=10).text, "html.parser")
+        for item in soup.select(".item-card")[:10]:
+            t=item.select_one(".item-title"); p=item.select_one(".sale-price"); o=item.select_one(".orig-price"); d=item.select_one(".discount"); a=item.select_one("a")
+            if not t or not p: continue
+            pct=re.search(r'(\d+)', d.get_text() if d else "0")
+            deals.append({"title":t.get_text(strip=True),"store":"AliExpress","original_price":o.get_text(strip=True) if o else "","sale_price":p.get_text(strip=True),"discount_pct":pct.group(1) if pct else "0","url":("https:" if a and a.get("href","").startswith("//") else "")+(a["href"] if a else ""),"coupon":"","free_shipping":True})
+    except Exception as e: log.error(f"AliExpress: {e}")
+    log.info(f"🌏 AliExpress: {len(deals)}")
+    return deals
+
+def scrape_coupons() -> list:
+    coupons = []
+    SKIP = {"HTTP","HTTPS","HTML","FREE","SALE","DEAL","CODE","PROMO","AVEC","POUR","DANS","PLUS","SANS","OFFRE","VOIR"}
+    for url in ["https://www.dealabs.com/rss/codes-promo","https://www.ma3ak.ma/feed/"]:
+        for e in parse_rss(url)[:10]:
+            full = e["title"]+" "+e["desc"]
+            m = re.search(r'\b([A-Z][A-Z0-9]{3,14})\b', full)
+            if not m: continue
+            code = m.group(1)
+            if code in SKIP or code.isdigit(): continue
+            store_map = {"amazon":"Amazon","aliexpress":"AliExpress","jumia":"Jumia","ebay":"eBay","shein":"Shein","noon":"Noon","cdiscount":"Cdiscount"}
+            store = next((name for key,name in store_map.items() if key in (full+e["link"]).lower()), "Dealabs")
+            pct_m = re.search(r'(\d+)\s*%', full)
+            amt_m = re.search(r'(\d+)[€$]\s*(?:de réduction|off|discount)', full)
+            clean = re.sub(r'\[.*?\]', '', e["title"].replace(code,"")).strip(" -–|")[:80]
+            coupons.append({"title":clean,"store":store,"coupon":code,"discount_pct":pct_m.group(1) if pct_m else "","discount_amt":amt_m.group(1) if amt_m else "","url":e["link"].split(" ")[0],"is_coupon":True})
+    log.info(f"🎟 Coupons: {len(coupons)}")
+    return coupons
+
+# ── Trigger ────────────────────────────────────────────────────────────────────
+def meets_trigger(deal: dict) -> bool:
+    try: pct = int(deal.get("discount_pct", 0))
+    except: pct = 0
+    return pct >= MIN_DISCOUNT_PCT or bool(deal.get("coupon")) or deal.get("flash_sale") or (deal.get("free_shipping") and pct >= 10)
+
+# ── Keep-alive ─────────────────────────────────────────────────────────────────
 def start_keepalive():
-    """
-    Starts a tiny web server so Railway/Render keeps the bot alive 24/7.
-    Railway and Render ping the server every few minutes — without this
-    they shut down free tier apps after inactivity.
-    """
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import threading
-
-    class Handler(BaseHTTPRequestHandler):
+    class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Deal Bot is running!")
-        def log_message(self, format, *args):
-            pass  # suppress access logs
-
+            self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+        def log_message(self, *a): pass
     port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    log.info(f"🌐 Keep-alive server running on port {port}")
+    threading.Thread(target=HTTPServer(("0.0.0.0", port), H).serve_forever, daemon=True).start()
+    log.info(f"🌐 Keep-alive on :{port}")
 
-
-# ── Main auto scan ─────────────────────────────────────────────────────────────
+# ── Main scan ──────────────────────────────────────────────────────────────────
 def run_auto_scan():
-    log.info("🤖 Auto-scan started...")
-    posted = load_posted()  # returns global POSTED_IDS (already loaded at startup)
-
-    # Scrape deals
-    all_deals = (
-        scrape_dealabs()
-        + scrape_amazon()
-        + scrape_aliexpress()
-        + scrape_jumia()
-    )
-
-    # Scrape coupons separately
-    all_coupons = scrape_coupons()
-
-    new_posted = 0
-
-    # Post deals
-    for deal in all_deals:
-        did = deal_id(deal)
+    log.info("🤖 Scanning all sources...")
+    items = scrape_dealabs() + scrape_jumia() + scrape_aliexpress() + scrape_coupons()
+    posted = 0
+    for item in items:
+        did = deal_id(item)
         if is_posted(did):
             continue
-        if meets_trigger(deal):
-            try:
-                text = format_telegram(deal)
-                asyncio.run(post_to_telegram(text))
-                posted.add(did)
-                new_posted += 1
-                time.sleep(5)
-            except Exception as e:
-                log.error(f"Error posting deal: {e}")
-
-    # Post coupons
-    for coupon in all_coupons:
-        did = deal_id(coupon)
-        if is_posted(did):
+        if not meets_trigger(item):
             continue
-        if coupon.get("coupon"):  # only post if has a real code
-            try:
-                text = format_coupon_telegram(coupon)
-                asyncio.run(post_to_telegram(text))
-                posted.add(did)
-                new_posted += 1
-                time.sleep(5)
-            except Exception as e:
-                log.error(f"Error posting coupon: {e}")
-
-    save_posted(posted)
-    log.info(f"✅ Scan done — {new_posted} new posts ({len(all_deals)} deals + {len(all_coupons)} coupons scanned)")
-
-
-# ── Manual deal post ───────────────────────────────────────────────────────────
-def submit_manual_deal(
-    title: str,
-    store: str,
-    original_price: str,
-    sale_price: str,
-    url: str,
-    coupon: str = "",
-    category: str = "general",
-    free_shipping: bool = False,
-):
-    discount_pct = "?"
-    try:
-        orig = float(re.sub(r"[^\d.]", "", original_price))
-        sale = float(re.sub(r"[^\d.]", "", sale_price))
-        discount_pct = str(round((1 - sale / orig) * 100))
-    except Exception:
-        pass
-
-    deal = {
-        "title": title, "store": store,
-        "original_price": original_price, "sale_price": sale_price,
-        "discount_pct": discount_pct, "url": url,
-        "coupon": coupon, "category": category,
-        "free_shipping": free_shipping,
-    }
-    text = format_telegram(deal)
-    print("\n=== TELEGRAM PREVIEW ===\n")
-    print(text)
-    asyncio.run(post_to_telegram(text))
-
+        try:
+            text = format_coupon(item) if item.get("is_coupon") else format_deal(item)
+            if asyncio.run(post_to_telegram(text)):
+                mark_posted(did)
+                posted += 1
+                time.sleep(8)
+        except Exception as e:
+            log.error(f"Error: {e}")
+    log.info(f"✅ {posted} new posts | {len(POSTED_IDS)} total tracked")
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
-
-    # Load posted history ONCE at startup into global memory
-    load_posted()
-    log.info(f"📋 Loaded {len(POSTED_IDS)} previously posted deals from history")
-
-    # Start keep-alive server for 24/7 hosting (Railway/Render)
-    try:
-        start_keepalive()
-    except Exception:
-        pass
-
-    if len(sys.argv) > 1 and sys.argv[1] == "manual":
-        submit_manual_deal(
-            title="Your Product Name",
-            store="Amazon",
-            original_price="$100",
-            sale_price="$60",
-            url="https://amazon.com/your-link",
-            category="tech",
-            free_shipping=True,
-        )
-    else:
-        log.info("🚀 Deal Bot started — scanning every 3 hours")
-        log.info(f"📊 Min discount: {MIN_DISCOUNT_PCT}% | Channel: {CHANNEL_ID}")
-        run_auto_scan()  # run immediately on start
-        schedule.every(3).hours.do(run_auto_scan)
-        schedule.every(6).hours.do(lambda: log.info("💓 Bot still alive"))
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
+    asyncio.run(init_memory())
+    try: start_keepalive()
+    except: pass
+    log.info(f"🚀 Bot started | Min discount: {MIN_DISCOUNT_PCT}% | Channel: {CHANNEL_ID}")
+    run_auto_scan()
+    schedule.every(3).hours.do(run_auto_scan)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
