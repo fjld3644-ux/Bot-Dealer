@@ -163,15 +163,47 @@ def parse_rss(url: str) -> list:
         return []
 
 # ── Scrapers ───────────────────────────────────────────────────────────────────
-def scrape_dealabs() -> list:
+def scrape_rss_deals(feeds: list, default_store: str) -> list:
     deals = []
-    for url in ["https://www.dealabs.com/rss/hot-deals","https://www.dealabs.com/rss/nouveaux-deals"]:
-        for e in parse_rss(url)[:15]:
+    for url in feeds:
+        for e in parse_rss(url)[:20]:
             pct = re.search(r'(\d+)\s*%', e["title"]+" "+e["desc"])
             price = re.search(r'[\$€£]\s*\d+[.,]\d+', e["desc"])
-            store = next((s.capitalize() for s in ["amazon","aliexpress","jumia","ebay"] if s in (e["title"]+e["desc"]+e["link"]).lower()), "Dealabs")
-            deals.append({"title":e["title"],"store":store,"original_price":"","sale_price":price.group(0) if price else "","discount_pct":pct.group(1) if pct else "0","url":e["link"],"coupon":"","free_shipping":"livraison gratuite" in e["desc"].lower()})
+            store = next((s.capitalize() for s in ["amazon","aliexpress","jumia","ebay","walmart","bestbuy"] if s in (e["title"]+e["desc"]+e["link"]).lower()), default_store)
+            deals.append({"title":e["title"][:80],"store":store,"original_price":"","sale_price":price.group(0) if price else "","discount_pct":pct.group(1) if pct else "0","url":e["link"],"coupon":"","free_shipping":"livraison gratuite" in e["desc"].lower() or "free shipping" in e["desc"].lower()})
+    return deals
+
+def scrape_dealabs() -> list:
+    deals = scrape_rss_deals([
+        "https://www.dealabs.com/rss/hot-deals",
+        "https://www.dealabs.com/rss/nouveaux-deals",
+        "https://www.dealabs.com/rss/bons-plans",
+    ], "Dealabs")
     log.info(f"🔥 Dealabs: {len(deals)}")
+    return deals
+
+def scrape_slickdeals() -> list:
+    deals = scrape_rss_deals([
+        "https://slickdeals.net/newsearch.php?mode=frontpage&searcharea=deals&searchin=first&rss=1",
+        "https://slickdeals.net/newsearch.php?mode=frontpage&searcharea=deals&searchin=first&rss=1&forumid[]=9",
+    ], "Amazon")
+    log.info(f"💥 Slickdeals: {len(deals)}")
+    return deals
+
+def scrape_reddit_deals() -> list:
+    deals = scrape_rss_deals([
+        "https://www.reddit.com/r/deals/.rss",
+        "https://www.reddit.com/r/buildapcsales/.rss",
+        "https://www.reddit.com/r/frugalmalefashion/.rss",
+    ], "Reddit")
+    log.info(f"👾 Reddit: {len(deals)}")
+    return deals
+
+def scrape_camel() -> list:
+    deals = scrape_rss_deals([
+        "https://camelcamelcamel.com/top_drops/amazon/rss",
+    ], "Amazon")
+    log.info(f"🐪 CamelCamelCamel: {len(deals)}")
     return deals
 
 def scrape_jumia() -> list:
@@ -243,7 +275,7 @@ def start_keepalive():
 # ── Main scan ──────────────────────────────────────────────────────────────────
 def run_auto_scan():
     log.info("🤖 Scanning all sources...")
-    items = scrape_dealabs() + scrape_jumia() + scrape_aliexpress() + scrape_coupons()
+    items = scrape_dealabs() + scrape_slickdeals() + scrape_reddit_deals() + scrape_camel() + scrape_jumia() + scrape_aliexpress() + scrape_coupons()
     posted = 0
     for item in items:
         did = deal_id(item)
