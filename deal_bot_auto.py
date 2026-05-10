@@ -5,7 +5,7 @@ Scrapes deals from Amazon, AliExpress, Jumia and Dealabs
 using free RSS feeds and public pages. No API keys needed.
 
 Setup:
-  pip install python-telegram-bot requests schedule python-dotenv feedparser beautifulsoup4
+  pip install python-telegram-bot requests schedule python-dotenv beautifulsoup4
 
 .env file required:
   TELEGRAM_BOT_TOKEN=your_token_here
@@ -24,7 +24,7 @@ import json
 from datetime import datetime
 from dotenv import load_dotenv
 import requests
-import feedparser
+import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -196,6 +196,23 @@ async def post_to_telegram(text: str) -> bool:
 
 
 # ── SCRAPER 1: Dealabs RSS (best — covers all stores) ─────────────────────────
+def parse_rss(url: str) -> list:
+    """Fetch and parse an RSS feed without feedparser."""
+    items = []
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        root = ET.fromstring(r.content)
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        for item in root.findall(".//item"):
+            title = item.findtext("title", "")
+            link  = item.findtext("link", "")
+            desc  = item.findtext("description", "")
+            items.append({"title": title, "link": link, "desc": desc})
+    except Exception as e:
+        log.warning(f"RSS parse error ({url}): {e}")
+    return items
+
+
 def scrape_dealabs() -> list:
     deals = []
     feeds = [
@@ -204,11 +221,10 @@ def scrape_dealabs() -> list:
     ]
     for url in feeds:
         try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:15]:
+            for entry in parse_rss(url)[:15]:
                 title = entry.get("title", "")
                 link  = entry.get("link", "")
-                desc  = entry.get("summary", "")
+                desc  = entry.get("desc", "")
 
                 # Extract discount % from title or description
                 pct_match = re.search(r'(\d+)\s*%', title + " " + desc)
@@ -424,11 +440,10 @@ def scrape_coupons() -> list:
 
     for source in sources:
         try:
-            feed = feedparser.parse(source["url"])
-            for entry in feed.entries[:10]:
+            for entry in parse_rss(source["url"])[:10]:
                 title = entry.get("title", "")
                 link  = entry.get("link", "")
-                desc  = entry.get("summary", "")
+                desc  = entry.get("desc", "")
 
                 # Extract coupon code — look for patterns like CODE, PROMO20, SAVE10
                 code_match = re.search(
