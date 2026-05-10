@@ -46,28 +46,42 @@ HEADERS = {
 }
 
 # ── Already-posted tracker ─────────────────────────────────────────────────────
-# Global in-memory set — survives across scans, resets only on restart
+# Global in-memory set
 POSTED_IDS: set = set()
 
 def load_posted() -> set:
+    """Load from env var (survives Railway restarts) or file."""
     global POSTED_IDS
     if POSTED_IDS:
-        return POSTED_IDS  # already loaded — use memory
+        return POSTED_IDS
+    # Try env var first (Railway-safe)
+    env_ids = os.getenv("POSTED_IDS_CACHE", "")
+    if env_ids:
+        POSTED_IDS = set(env_ids.split(","))
+        log.info(f"📋 Loaded {len(POSTED_IDS)} posted IDs from env cache")
+        return POSTED_IDS
+    # Fall back to file
     try:
         with open(POSTED_FILE) as f:
             POSTED_IDS = set(json.load(f))
+        log.info(f"📋 Loaded {len(POSTED_IDS)} posted IDs from file")
     except Exception:
         POSTED_IDS = set()
     return POSTED_IDS
 
 def save_posted(posted: set):
+    """Save to file. In-memory always up to date."""
     global POSTED_IDS
-    POSTED_IDS = posted  # update memory
+    POSTED_IDS = posted
     try:
         with open(POSTED_FILE, "w") as f:
             json.dump(list(posted)[-500:], f)
     except Exception:
-        pass  # memory still works even if file write fails
+        pass
+
+def is_posted(did: str) -> bool:
+    """Fast check — use global memory directly."""
+    return did in POSTED_IDS
 
 def deal_id(deal: dict) -> str:
     # For coupons use the code as unique key, for deals use title+url
@@ -576,7 +590,7 @@ def start_keepalive():
 # ── Main auto scan ─────────────────────────────────────────────────────────────
 def run_auto_scan():
     log.info("🤖 Auto-scan started...")
-    posted = load_posted()
+    posted = load_posted()  # returns global POSTED_IDS (already loaded at startup)
 
     # Scrape deals
     all_deals = (
@@ -594,7 +608,7 @@ def run_auto_scan():
     # Post deals
     for deal in all_deals:
         did = deal_id(deal)
-        if did in posted:
+        if is_posted(did):
             continue
         if meets_trigger(deal):
             try:
@@ -609,7 +623,7 @@ def run_auto_scan():
     # Post coupons
     for coupon in all_coupons:
         did = deal_id(coupon)
-        if did in posted:
+        if is_posted(did):
             continue
         if coupon.get("coupon"):  # only post if has a real code
             try:
@@ -661,8 +675,11 @@ def submit_manual_deal(
 if __name__ == "__main__":
     import sys
 
+    # Load posted history ONCE at startup into global memory
+    load_posted()
+    log.info(f"📋 Loaded {len(POSTED_IDS)} previously posted deals from history")
+
     # Start keep-alive server for 24/7 hosting (Railway/Render)
-    # Comment this out if running locally on your PC
     try:
         start_keepalive()
     except Exception:
