@@ -506,20 +506,21 @@ def format_coupon_telegram(deal: dict) -> str:
     else:
         saving_line = "💰 Apply at checkout for instant savings!"
 
-    link_line = f'🛒 <a href="{url}">Shop now →</a>' if url else ""
+    url_clean = url.split(" ")[0].strip() if url else ""  # remove any trailing junk
+    link_line  = f'🛒 <a href="{url_clean}">Shop now</a>' if url_clean else ""
     title_line = f"📌 {title}" if title else ""
 
     lines = [
         f"🎟️ <b>PROMO CODE — {store} {s_emoji}</b>",
         "",
-        f"🔑 Code: <code>{code}</code>  ← tap to copy",
+        f"🔑 Code: <code>{code}</code>",
+        "👆 Tap the code to copy it!",
         "",
         saving_line,
         title_line,
         "",
         link_line,
-        "",
-        "⚡ Limited time — use it before it expires!",
+        "⚡ Limited time — use before it expires!",
         f"#coupon #promocode #{store.lower().replace(' ','')} #deals #bonplan",
     ]
     return "\n".join(l for l in lines if l)
